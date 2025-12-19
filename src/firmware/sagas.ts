@@ -1034,6 +1034,9 @@ function* handleRestoreOfficialDfu(
 const getNextEV3MessageId = createCountFunc();
 
 function* handleFlashEV3(action: ReturnType<typeof firmwareFlashEV3>): Generator {
+    // Binary log for EV3 HID input/output reports
+    const hidLog: number[] = [];
+
     if (navigator.hid === undefined) {
         yield* put(alertsShowAlert('firmware', 'noWebHid'));
         yield* put(firmwareDidFailToFlashEV3());
@@ -1082,6 +1085,26 @@ function* handleFlashEV3(action: ReturnType<typeof firmwareFlashEV3>): Generator
         }
     }
 
+    // Add file save prompt to exit stack
+    exitStack.push(async () => {
+        try {
+            const fileHandle = await window.showSaveFilePicker({
+                suggestedName: 'ev3-hid-log.bin',
+                types: [
+                    {
+                        description: 'Binary Log',
+                        accept: { 'application/octet-stream': ['.bin'] },
+                    },
+                ],
+            });
+            const writable = await fileHandle.createWritable();
+            await writable.write(new Uint8Array(hidLog));
+            await writable.close();
+        } catch (err) {
+            console.log('File save cancelled or failed:', err);
+        }
+    });
+
     const [, openError] = yield* call(() => maybe(hidDevice.open()));
     if (openError) {
         console.error(openError);
@@ -1107,6 +1130,14 @@ function* handleFlashEV3(action: ReturnType<typeof firmwareFlashEV3>): Generator
             }
 
             const length = event.data.getInt16(0, true);
+
+            // Log input report with 'i' prefix, truncated at length + 9
+            hidLog.push('i'.charCodeAt(0));
+            const inputData = new Uint8Array(event.data.buffer);
+            const truncateAt = Math.min(length + 9, inputData.length);
+            for (let i = 0; i < truncateAt; i++) {
+                hidLog.push(inputData[i]);
+            }
             const replyNumber = event.data.getInt16(2, true);
             const messageType = event.data.getUint8(4);
             const replyCommand = event.data.getUint8(5);
@@ -1153,6 +1184,12 @@ function* handleFlashEV3(action: ReturnType<typeof firmwareFlashEV3>): Generator
         data.setUint8(5, command);
         if (payload) {
             dataBuffer.set(payload, 6);
+        }
+
+        // Log output report with 'o' prefix
+        hidLog.push('o'.charCodeAt(0));
+        for (let i = 0; i < dataBuffer.length; i++) {
+            hidLog.push(dataBuffer[i]);
         }
 
         const [, sendError] = yield* call(() => maybe(hidDevice.sendReport(0, data)));
@@ -1219,12 +1256,16 @@ function* handleFlashEV3(action: ReturnType<typeof firmwareFlashEV3>): Generator
 
     defined(version);
 
-    console.debug(
-        `EV3 bootloader version: ${version.getUint32(
-            0,
-            true,
-        )}, HW version: ${version.getUint32(4, true)}`,
-    );
+    try {
+        console.debug(
+            `EV3 bootloader version: ${version.getUint32(
+                0,
+                true,
+            )}, HW version: ${version.getUint32(4, true)}`,
+        );
+    } catch (err) {
+        console.error(`Failed to parse ev3 version response: ${ensureError(err)}`);
+    }
 
     // FIXME: should be called much earlier.
     yield* put(didStart());
@@ -1318,6 +1359,9 @@ function* handleFlashEV3(action: ReturnType<typeof firmwareFlashEV3>): Generator
     yield* put(didFinish());
 
     yield* cleanup();
+
+    // Log the collected HID binary data
+    console.log('EV3 HID binary log:', new Uint8Array(hidLog));
 
     yield* put(firmwareDidFlashEV3());
 }
